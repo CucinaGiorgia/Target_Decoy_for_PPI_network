@@ -1,0 +1,954 @@
+---
+title: "Target_Decoy_Strategy_for_PPI_network"
+editor_options: 
+  chunk_output_type: console
+---
+
+# TARGET_DECOY STRATEGY
+
+This workflow is aimed to increase the confidence of having physical interactions in a PPI network.
+To do so, all the interactions are first downloaded from String Database, which is a comprehensive DB containing both functinal and physiscal associations between proteins. To validate the interactions and increase the confidence of having an higher probability of physical interactions representations, it is used CORUM Database.
+
+## Upload data and libraries
+```{r Libraries}
+library(openxlsx)
+library(here)
+library(limma)
+library(dplyr)
+library(tibble)
+library(janitor)
+library(ggplot2)
+library(rbioapi)
+library(OmnipathR)
+library(purrr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(stringr)
+library(readr)
+
+#QProMS
+library(data.table)
+source(file = here::here("myfun_test.R"))
+
+```
+
+```{r Data upload}
+mn_proteome<- data.table::fread(here::here("proteinGroups_sqstm1.txt")) %>%
+janitor::clean_names() %>%
+dplyr::filter(potential_contaminant != "+" &
+only_identified_by_site != "+" &
+reverse != "+") %>% 
+dplyr::select(protein_i_ds,
+dplyr::starts_with("i_baq_")
+) %>%
+dplyr::mutate(protein_i_ds = stringr::str_extract(protein_i_ds, "[^;]*")) %>%
+dplyr::select(-c(i_baq_peptides,i_baq_mn5)) %>%
+tidyr::pivot_longer(!protein_i_ds, names_to = "label", values_to = "ibaq") %>%
+dplyr::mutate(value = if_else(ibaq == 0, 0, 1)) %>%
+dplyr::mutate(condition= if_else(stringr::str_detect(label, "i_baq_mn"), "mnuc", "nuc")) %>%
+dplyr::group_by(protein_i_ds, condition) %>%
+dplyr::mutate(sumvalue = sum(value)) %>%
+dplyr::filter(sumvalue >= 3) %>%
+dplyr::mutate(ibaq= log2(ibaq)) %>%
+dplyr::mutate(ibaq = if_else(ibaq == -Inf, 0, ibaq)) %>%
+dplyr::summarise(mean_ibaq= round(mean(ibaq, na.rm=TRUE), 3)) %>%
+dplyr::ungroup() %>% 
+tidyr::pivot_wider(id_cols = protein_i_ds, names_from = "condition", values_from = "mean_ibaq") %>%
+dplyr::mutate(mnuc = if_else(is.na(mnuc), 0, mnuc)) %>%
+dplyr::mutate(nuc = if_else(is.na(nuc), 0, nuc))
+
+
+limma <- openxlsx::read.xlsx(xlsxFile = "/Users/giorgiacucina/QProMS_functions.git/Imputed_table_2023-09-19.xlsx")
+
+```
+
+```{r STRING DB upload}
+gene_names <-
+  data.table::fread(here::here("9606.protein.info.v12.0.txt")) %>%
+  dplyr::select(string_protein_id, preferred_name)
+
+human_string_raw <-
+  data.table::fread(here::here("9606.protein.links.detailed.v12.0.txt")) 
+
+human_string <-
+  human_string_raw %>% 
+  dplyr::mutate(score = combined_score / 1000,
+                escore = experimental / 1000,
+                dscore = database / 1000) %>%
+  dplyr::left_join(gene_names, by = c("protein1" = "string_protein_id")) %>%
+  dplyr::rename("source" = "preferred_name") %>%
+  dplyr::left_join(gene_names, by = c("protein2" = "string_protein_id")) %>%
+  dplyr::rename("target" = "preferred_name") %>%
+  dplyr::mutate(score1 = (escore - 0.041) * (1 - 0.041)) %>%
+  dplyr::mutate(score2 = (dscore - 0.041) * (1 - 0.041)) %>%
+  dplyr::mutate(score_combin = 1 - (1 - score1) * (1 - score2)) %>%
+  dplyr::mutate(re_score = score_combin + 0.041 * (1 - score_combin)) %>%
+  dplyr::mutate(re_score = round(re_score, 3)) %>%
+  dplyr::mutate(re_score= if_else(re_score<0, 0, re_score)) %>% 
+  dplyr::select(source, target, score, re_score, protein1, protein2)
+```
+
+
+```{r All the functions}
+string_find_interactors <- function(table, score=400, limits=NULL) {
+  
+  gene_list <- table %>%
+    dplyr::pull(gene_names)
+  
+  data <-
+    rba_string_interaction_partners(
+      ids = gene_list,
+      species = 9606,
+      required_score = score,
+      limit = limits
+    ) %>%
+    dplyr::select(source = preferredName_A, target = preferredName_B, score) %>% #Real vs predicted instead of source and target
+    unique() # GUARDA QUI
+  return(data)
+}
+
+predicted_node_table <- function(predicted_table_interactors, table) {
+  predict <- predicted_table_interactors %>%
+    dplyr::count(target) %>%
+    pull(target)
+  
+  sperimental <- table %>%
+    pull(gene_names)
+  
+  nodes_predicted_all <- c(predict, sperimental)
+  
+  nodes_predicted <- unique(nodes_predicted_all)
+  
+  return(nodes_predicted)
+}
+
+corum_edges <- function(predicted_list) {
+
+raw_corum_table <-
+    get_complex_genes(import_omnipath_complexes(resources = "CORUM"),
+                      predicted_list,
+                      total_match = FALSE) %>%
+    unique() %>%
+    dplyr::select(name, components_genesymbols) %>%
+    tidyr::separate_rows(components_genesymbols, sep = "_") %>%
+    dplyr::filter(components_genesymbols %in% predicted_list) %>%
+    unique() %>% 
+    get_dupes(name)
+
+    expand_nodes <- raw_corum_table %>%
+      dplyr::group_by(name) %>%
+      dplyr::group_map( ~ dplyr::pull(.x, components_genesymbols)) 
+    
+    edges_corum_table <-
+      purrr::map(.x = expand_nodes, .f = ~ as.data.frame(t(combn(.x, 2)))) %>% 
+      purrr::reduce(dplyr::bind_rows) %>% 
+      dplyr::rename(target = V1,  source = V2) %>%
+      dplyr::left_join(raw_corum_table, by = c("source" = "components_genesymbols")) %>% 
+      dplyr::select(-dupe_count) %>% 
+      dplyr::select(source, target) %>%
+      unique() %>% 
+      dplyr::mutate(source_target = paste0(source, "_", target)) %>%
+      dplyr::mutate(target_source = paste0(target, "_", source))
+    
+    return(edges_corum_table)
+}
+
+roc_precision_data <- function(corum_table, string_predicted_interactors) {
+  
+    data <- string_predicted_interactors %>%
+      dplyr::select(-re_score) %>% 
+      dplyr::mutate(
+        corum = case_when(
+          source_target %in% corum_table$source_target ~ 1,
+          source_target %in% corum_table$target_source ~ 1,
+          TRUE ~ 0
+        )
+      )
+    
+    df <- tibble::tibble()
+    
+    for (i in seq(from = 1, to = 0, by = -0.10)) {
+      string_thr <- data %>%
+        dplyr::mutate(thr = if_else(score >= i, "yes", "no")) #Vedo quali interazioni di String sono anche in CORUM (TP)
+      
+      for (j in 1:10) {
+        set.seed(j)
+        source <-
+          sample(
+            string_thr$source,
+            size = sum(string_thr$corum == 1),
+            replace = TRUE
+          )
+        target <-
+          sample(
+            string_thr$target,
+            size = sum(string_thr$corum == 1),
+            replace = TRUE
+          )
+        
+        random_int <- cbind(source, target) %>%
+          as.data.frame() %>%
+          dplyr::left_join(human_string, by = join_by(source, target)) %>%
+          dplyr::mutate(score = dplyr::if_else(is.na(score), 0, score)) %>% 
+          dplyr::select(-re_score)
+        
+        df_1 <-
+          tibble::tibble(
+                    TP = sum(string_thr$thr == "yes" & string_thr$corum == 1),
+                    FN = sum(string_thr$thr == "no" & string_thr$corum == 1),
+                    TPR = TP / (TP + FN),
+                    FP = sum(random_int$score >= i),
+                    TN = sum(random_int$score < i),
+                    FPR = FP / (FP + TN),
+                    STRINGSCORE = i,
+                    fold = j
+                  )  
+        
+        df <- rbind(df, df_1)
+        
+      }
+    }
+    
+    
+    df_final <- df %>%
+      dplyr::mutate(P = TP / (TP + FP)) %>%
+      dplyr::group_by(STRINGSCORE) %>%
+      dplyr::summarise(
+        FPR_mean = mean(FPR),
+        FPR_sd = sd(FPR),
+        TPR_mean = mean(TPR),
+        TPR_sd = sd(TPR),
+        P_mean = mean(P),
+        P_sd = sd(P)
+      ) 
+    return(df_final)
+        print(df_final)
+}
+
+roc_precision_graph <- function(data, graph) {
+  if (graph=="roc") {
+    p1 <- ggplot2::ggplot(data, aes(
+      x = FPR_mean,
+      y = TPR_mean,
+      color = as.factor(STRINGSCORE)
+    )) +
+      geom_point() +
+      geom_line()+
+      labs(x = "False Positive Rate",
+           y = "True Positive Rate",
+           title = "ROC Curve")  +
+      geom_abline(slope = 1, linetype = "dashed") +
+      geom_errorbar(aes(xmin = FPR_mean - FPR_sd,
+                        xmax = FPR_mean + FPR_sd),
+                    color = "black") +
+      geom_rect(aes(
+        xmin = 0,
+        xmax = 0.1,
+        ymin = 0.6,
+        ymax = 1
+      ),
+      color = "darkgrey",
+      alpha = 0)
+    
+    p2 <- ggplot2::ggplot(data, aes(
+      x = FPR_mean,
+      y = TPR_mean,
+      color = as.factor(STRINGSCORE)
+    )) +
+      geom_point() +
+        geom_errorbar(aes(xmin = FPR_mean - FPR_sd,
+                        xmax = FPR_mean + FPR_sd),
+                    color = "black")+
+  xlim(0, 0.1)+
+  ylim(0.6, 1)+
+  theme_bw() +
+  theme(
+    axis.title = element_blank(), legend.position = "none"
+  )
+    p<- p1 + 
+  # xmin, xmax, ymin, ymax represent the position and dimension of the zoomed plot
+  annotation_custom(ggplotGrob(p2), xmin = 0.6, xmax = 1, ymin = 0, ymax = 0.5) +
+  # this geom_rect() draws the border dashed line of the zoomed plot
+  geom_rect(aes(xmin = 0.6, xmax = 1, ymin = 0, ymax = 0.5), color='darkgrey', alpha=0)
+      
+  }else {
+    p <- ggplot2::ggplot(data, aes(
+      x = TPR_mean,
+      y = P_mean,
+      color = as.factor(STRINGSCORE)
+    )) +
+      geom_point() +
+      geom_errorbar(aes(ymin = P_mean - P_sd,
+                        ymax = P_mean + P_sd),
+                    color = "black") +
+      labs(x = "Recall",
+           y = "Precision",
+           title = "Precision-Recall Curve")
+  }
+  
+  p<-p +
+    geom_line(color = "black") +
+      guides(color = guide_legend(title = "Score")) +
+      ylim(0, 1) +
+      xlim(0, 1) +
+  theme_bw()
+  return(p)
+}
+
+enrichment_table <- function(predicted_table_interactors, thr, ontology, simplify_thr, table) {
+  
+  roc_filtered <- predicted_table_interactors %>% 
+    dplyr::filter(re_score>=thr) %>% 
+    dplyr::count(target) %>%
+    pull(target)
+  
+  sperimental <- table %>%
+    pull(gene_names)
+  
+  nodes_predicted_all <- c(roc_filtered, sperimental)
+  
+  nodes_roc_filtered <- unique(nodes_predicted_all)
+  
+  enrich <-
+    enrichGO(nodes_roc_filtered,
+      OrgDb = org.Hs.eg.db,
+      keyType= "SYMBOL",
+      ont = ontology,
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05
+    ) %>%
+    setReadable(OrgDb = org.Hs.eg.db) %>%
+    simplify(., cutoff = simplify_thr,
+             by = "p.adjust") 
+  
+  
+    GO <- enrich@result %>%
+    
+    dplyr::select(Description, GeneRatio, BgRatio, pvalue, qvalue, geneID, Count) %>% 
+    tidyr::separate_rows(geneID, sep = "/") %>%
+    dplyr::mutate(experimental = if_else(geneID %in% table$gene_names, 1, 0)) %>%
+    dplyr::group_by(Description) %>%
+    dplyr::mutate(exp = sum(experimental == 1)) %>%
+    dplyr::mutate(ratio = exp / Count) %>%
+    dplyr::arrange(desc(ratio), qvalue) %>%
+    tidyr::separate(GeneRatio,
+                    into = c("a", "b"),
+                    sep = "/",
+                    remove = FALSE) %>%
+    tidyr::separate(BgRatio,
+                    into = c("c", "d"),
+                    sep = "/",
+                    remove = FALSE) %>%
+    dplyr::mutate(fold_enrichment = (as.numeric(a) / as.numeric(b)) /
+                    (as.numeric(c) / as.numeric(d))) %>%
+    dplyr::select(-c(a, b, c, d)) %>%
+    dplyr::mutate(geneID_sperimental = if_else(experimental == 1, geneID, "")) %>%
+    dplyr::mutate(geneID_predicted = if_else(experimental == 0, geneID, "")) %>%
+    dplyr::select(-experimental) %>% #To improve.
+    dplyr::ungroup() %>%
+    tidyr::nest(gene_names = c(geneID_predicted, geneID_sperimental, geneID)) %>%
+    tidyr::unnest_wider(gene_names)
+  
+  return(GO)
+}
+
+string_exp_int <- function(table) {
+  gene_list <- table %>%
+    dplyr::pull(gene_names)
+  
+  data <-
+    rba_string_interactions_network(ids = gene_list,
+                                    species = 9606,
+                                    required_score = 100) %>% 
+  tidyr::unite("StringID", stringId_A:stringId_B, remove = TRUE) %>% 
+  dplyr::distinct(StringID, .keep_all = TRUE) %>% 
+  dplyr::select(source = preferredName_A, target = preferredName_B, score, escore, dscore) 
+  
+  rescoring <- data %>% 
+    dplyr::mutate(score1 = (escore - 0.041) * (1 - 0.041)) %>%
+    dplyr::mutate(score2 = (dscore - 0.041) * (1 - 0.041)) %>%
+    dplyr::mutate(score_combin = 1 - (1 - score1) * (1 - score2)) %>%
+    dplyr::mutate(re_score = score_combin + 0.041 * (1 - score_combin)) %>%
+    dplyr::mutate(re_score = round(re_score, 3)) %>%
+    dplyr::mutate(source_target = paste0(source, "_", target)) %>%
+    dplyr::mutate(target_source = paste0(target, "_", source)) %>%
+    dplyr::mutate(re_score= if_else(re_score<0, 0, re_score)) %>% 
+    dplyr::select(source, target, score, re_score, source_target, target_source)
+  return(rescoring)
+}
+
+ideal_score <- function(roc_table, error_rate=0.05){
+  data <- roc_table %>% 
+  dplyr::select(score=STRINGSCORE, FPR=FPR_mean) %>% 
+  dplyr::filter(FPR<error_rate) %>% 
+  pull(score)
+  
+  return(data)
+}
+```
+
+# LIMMA Statistics
+```{r LIMMA}
+limma_matrix <-
+  limma %>% tibble::column_to_rownames("gene_names") %>%
+  as.matrix()
+
+group_list <- factor(x=c("apex","apex","apex","apex","apex", "only","only","only","only","only"), levels = c("apex", "only"))
+
+design <- model.matrix(~group_list)
+limma_fit <- limma::lmFit(limma_matrix, design) 
+fit <- eBayes(limma_fit)
+limma_tibble<- topTable(fit, number = nrow(limma)) %>% tibble::rownames_to_column("gene_names") %>%
+  dplyr::filter(adj.P.Val<0.05) %>% 
+  dplyr::filter(logFC>0) %>% 
+  dplyr::mutate(p_adj= -log10(adj.P.Val)) %>% 
+  dplyr::mutate(gene_names= stringr::str_replace(gene_names, "_.*", ""))
+```
+
+
+```{r Proteome MN- Limma statistics}
+# Applied limma statistics to the micronuclei proteome
+mn_limma<- openxlsx::read.xlsx(xlsxFile = "Univariate_table_2023-10-20.xlsx") %>% 
+  dplyr::filter(mnuc_vs_nuc_significant) %>% 
+  dplyr::filter(mnuc_vs_nuc_fold_change>2) #Only selected significant upregulated
+
+#Find all the interaction between our significant
+mn_limma_int <- string_exp_int(table = mn_limma)
+  # dplyr::filter(re_score!=0) #Filtro via tutte le interazioni che hanno un rescore=0
+
+
+# write.table(mn_limma_int,file ="/Users/giorgiacucina/Desktop/mn_limma.txt", quote = FALSE, sep = "\t", row.names = FALSE)
+
+#Find interactions in CORUM
+mn_limma_corum <- corum_edges(predicted_list = mn_limma$gene_names)
+
+#Build the table to calculate the FPR of the scores
+mn_limma_roc_table <- roc_precision_data(corum_table = mn_limma_corum, string_predicted_interactors = mn_limma_int)
+roc_precision_graph(data = mn_limma_roc_table, graph = "roc")
+
+ideal_score(roc_table = mn_limma_roc_table, error_rate = 0.01)
+
+filt_mn <- mn_limma_int %>% dplyr::filter(score>=0.8)
+ # write.table(filt_mn,file ="/Users/giorgiacucina/Desktop/mn_limma_int.txt", quote = FALSE, sep = "\t", row.names = FALSE)
+
+#Enrichment analysis of the filtered table by FPR<0.05
+mn_limma_enrichment <- enrichment_table(predicted_table_interactors = mn_limma_int, thr = 0.8, ontology = "CC", simplify_thr = 0.8, table = mn_limma)  
+```
+
+```{r Limma only experimental}
+limma_string <- string_exp_int(table = limma_tibble) 
+   
+
+# limma_string %>% write.table(file = "/Users/giorgiacucina/Desktop/limma_string.txt", quote = FALSE, sep = "\t", row.names = FALSE)
+
+corum_interactions <- corum_edges(predicted_list = limma_tibble %>%  pull(gene_names))
+
+limma_exp_roc <- roc_precision_data(corum_table = corum_interactions, string_predicted_interactors = limma_string)
+roc_precision_graph(data = limma_exp_roc, graph = "roc")
+
+ideal_score(roc_table = limma_exp_roc, error_rate = 0.05)
+
+
+limma_exp_enrich<- enrichment_table(predicted_table_interactors = limma_string, thr = 0.9, ontology = "CC", simplify_thr = 0.8, table = limma_tibble)
+
+
+```
+## QProMS pipeline
+
+```{r loading-data-1}
+raw_data <- loading_data(file_path = here::here("proteinGroups_sqstm1.txt"))
+```
+
+
+```{r make-expdesign-1}
+exp_des <- exp_design (data=raw_data, pattern_interest = "lfq_intensity_") %>% 
+dplyr::mutate(label = stringr::str_replace_all(label, "[n]", "nuc")) %>% 
+  dplyr::mutate(label = stringr::str_replace_all(label, "mnuc", "micro")) %>% 
+        dplyr::mutate(condition = stringr::str_replace_all(condition, "[n]", "nuc")) %>%
+        dplyr::mutate(condition = stringr::str_replace_all(condition, "[12345]", "")) %>%
+          dplyr::mutate(condition = stringr::str_replace_all(condition, "mnuc", "micro")) %>% 
+        dplyr::mutate(replicate = stringr::str_replace_all(replicate, "[micronuc]", ""))
+
+```
+
+
+```{r Data preprocessing 1}
+data_pre <- pre_process (data=raw_data, pattern_interest =  "lfq_intensity_")
+```
+
+
+```{r Wrangling/Data filtered}
+data_wrang <- data_wrangling(data=data_pre,
+                             pep_filter = "peptides",
+                             pep_thr = 2)
+```
+
+
+```{r Data Filtered}
+data_filt <- data_filtered(data = data_wrang,
+                           valid_val_filter = "alog",
+                           valid_val_thr = 0.75)
+
+#Missing data distribution MICRONUCLEI
+miss_distr<- data_filt %>% dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(mean = mean(intensity, na.rm = TRUE)) %>%
+  dplyr::filter(condition=="micro") %>% 
+  dplyr::mutate(missing=dplyr::case_when(sum(bin_intensity)==0 ~ "5",
+                                         sum(bin_intensity) == 1 ~ "4",
+                                         sum(bin_intensity) == 2 ~ "3",
+                                         sum(bin_intensity) == 3 ~ "2",
+                                         sum(bin_intensity) == 4 ~ "1",
+                                         sum(bin_intensity) == 5 ~ "0", 
+                                         TRUE ~ ""
+                                                )) %>% 
+  ggplot2::ggplot(aes(x= missing, fill=missing)) +
+  geom_bar(color="#0081A7", position = "identity", alpha=0.8) +
+  geom_text(
+    stat = "count",
+    aes(label = after_stat(count)),
+    position = position_stack(vjust = 0.5),
+    color = "black",
+    size = 3
+  )
+print(miss_distr)
+ 
+
+#Missing data distribution NUCLEI
+miss_distr<- data_filt %>% dplyr::group_by(gene_names, condition) %>%
+  dplyr::filter(condition=="nuc") %>% 
+  dplyr::mutate(missing=dplyr::case_when(sum(bin_intensity)==0 ~ "4",
+                                         sum(bin_intensity) == 1 ~ "3",
+                                         sum(bin_intensity) == 2 ~ "2",
+                                         sum(bin_intensity) == 3 ~ "1",
+                                         sum(bin_intensity) == 4 ~ "0",
+                                         TRUE ~ ""
+                                                )) %>% 
+  ggplot2::ggplot(aes(x= missing, fill=missing)) +
+  geom_bar(color="#0081A7", position = "identity", alpha=0.8)+
+  geom_text(
+    stat = "count",
+    aes(label = after_stat(count)),
+    position = position_stack(vjust = 0.5),
+    color = "black",
+    size = 3
+  ) 
+print(miss_distr)
+  View()
+
+  
+color_palette<- c("#FF7480","#0d0887")
+
+htmap(data = data_filt)
+
+  map <- data_filt %>%
+    dplyr::select(gene_names, label, intensity) %>%
+    tidyr::pivot_wider(names_from = label, values_from = intensity) %>%
+    dplyr::filter(dplyr::if_all(.cols = dplyr::everything(), .fns = ~ !is.na(.x))) %>%
+    tibble::column_to_rownames("gene_names") %>%
+    cor() %>%
+    round(digits = 2) %>%
+    ggplot2::ggplot(heatmap())
+    Heatmap(name="Correlation",
+            col = c("#FF7480","#00AFB9"),
+            column_title = "Correlation plot",
+            column_title_gp=gpar(fontsize=18),
+            cluster_rows = FALSE,
+            cluster_columns = FALSE)
+  
+mat <- function(data) {
+  mat <- data %>% 
+    dplyr::select(gene_names, label, intensity) %>%
+    tidyr::pivot_wider(id_cols = "gene_names",
+                       names_from = "label",
+                       values_from = "intensity") %>%
+    tibble::column_to_rownames("gene_names") %>%
+    as.matrix()
+  return(mat)
+}
+
+
+
+#PCAPLOT
+pca_plot <- function(data,
+                     color1="#43BF71FF",
+                     color2="#21908CFF",
+                     color3="#35608DFF"){
+  
+  pca <- ggplot2::ggplot(data, aes(x=x, y=y),group=condition)+
+  geom_point(size=3, shape=19, aes(color=condition))+
+  theme_cuc()+
+  geom_hline(yintercept = 0, linetype="longdash")+
+  geom_vline(xintercept = 0, linetype="longdash")+
+  scale_color_manual(values = c(color1, color2, color3))+
+  labs(title="PCA", subtitle = "Principal component analysis", x="PC1", y="PC2")+
+  geom_text(aes(label=replicate), size=3, position = "dodge", hjust=1.5)
+  
+  return(pca)
+}
+```
+
+
+```{r Data Filtered GRAPH}
+#Random
+data_filt %>% dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(mean = mean(intensity, na.rm = TRUE)) %>%
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>%
+  dplyr::filter(for_imp==c("mean", "no")) %>% 
+
+  ungroup() %>%
+  dplyr::mutate(rank = rank(-mean, ties.method = "first")) %>% 
+  ggplot2::ggplot(aes(x = rank, y = mean, color=for_imp)) +
+   scale_color_manual(values=c("#EA7317","#00AFB9"))+
+  geom_point(size=3, alpha=0.3)+
+  xlim(0, 10000)+
+  theme(axis.text = element_text(size=15), legend.position = "none")+
+theme_bw()
+
+
+#Not at random
+data_filt <- data_filtered(data = data_wrang,
+                           valid_val_filter = "alog",
+                           valid_val_thr = 0.75)
+
+data_filt %>% dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(mean = mean(intensity, na.rm = TRUE)) %>%
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>%
+  dplyr::filter(for_imp==c("mixed", "no")) %>%
+  ungroup() %>%
+  dplyr::mutate(rank = rank(-mean, ties.method = "first")) %>% 
+  ggplot2::ggplot(aes(x = rank, y = mean, color=for_imp)) +
+   scale_color_manual(values=c("#FEC601", "#00AFB9"))+
+  geom_point(size=3, alpha=0.3)+
+  theme(axis.text = element_text(size=15), legend.position = "none")+
+theme_bw()
+
+
+
+data_filt %>%
+  dplyr::group_by(gene_names, condition) %>% 
+  dplyr::mutate(mean = mean(intensity, na.rm = TRUE)) %>%
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>% 
+  dplyr::filter(condition=="micro") %>% 
+  ggplot2::ggplot(aes(x= for_imp, y = mean, fill=for_imp)) +
+  geom_boxplot(color="#0081A7", position = "identity", alpha=0.8) 
+
+
+
+#Not at random MICRONUCLEI
+data_filt <- data_filtered(data = data_wrang,
+                           valid_val_filter = "alog",
+                           valid_val_thr = 0.75)
+
+
+
+data_filt %>% dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(mean = mean(intensity, na.rm = TRUE)) %>%
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>%
+  dplyr::filter(for_imp==c("mixed", "no")) %>%
+  dplyr::filter(condition=="micro") %>%
+  ungroup() %>%
+  dplyr::mutate(rank = rank(-mean, ties.method = "first")) %>% 
+  ggplot2::ggplot(aes(x = rank, y = mean, color=for_imp)) +
+   scale_color_manual(values=c("#FEC601", "#00AFB9"))+
+  geom_point(size=3, alpha=0.3)+
+  theme(axis.text = element_text(size=15), legend.position = "none")+
+theme_bw()
+
+
+#Random MICRONUCLEI
+data_filt %>% dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(mean = mean(intensity, na.rm = TRUE)) %>%
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>%
+  dplyr::filter(for_imp==c("mean", "no")) %>% 
+  dplyr::filter(condition=="micro") %>%
+  ungroup() %>%
+  dplyr::mutate(rank = rank(-mean, ties.method = "first")) %>% 
+  ggplot2::ggplot(aes(x = rank, y = mean, color=for_imp)) +
+   scale_color_manual(values=c("#EA7317","#00AFB9"))+
+  geom_point(size=3, alpha=0.3)+
+  xlim(0, 10000)+
+  theme(axis.text = element_text(size=15), legend.position = "none")+
+theme_bw()
+
+
+
+
+
+```
+
+
+```{r Data imputed Mixed imputation}
+data_imput <- data_imputed (data= data_filt,
+                         shift = 1.8, 
+                         scale = 0.3, 
+                         unique_visual = FALSE)
+
+data_imput %>% 
+  dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(value = dplyr::if_else(bin_intensity == 1, "1", "2")) %>% #1 valori validi 2 valori imputed
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>% 
+  dplyr::filter(for_imp==c("mean", "no")) %>%
+  ungroup() %>%
+  dplyr::arrange(value) %>% 
+  ggplot2::ggplot(aes(x = intensity, fill = value)) +
+  geom_histogram(color = "#6c757d",
+                 position = "identity",
+                 alpha = 1, bins=50) +
+  scale_fill_manual(values = c("#ced4da","#EA7317")) +
+  theme(axis.text = element_text(size=15), legend.position = "none")+
+  labs(fill = "Values") +
+  theme_bw()
+
+
+
+data_imput %>%
+  dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(value = dplyr::if_else(bin_intensity == 1, "1", "2")) %>% #1 valori validi 2 valori imputed
+  dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                )) %>% 
+  dplyr::filter(for_imp==c("mixed", "no")) %>%
+  ungroup() %>% 
+  dplyr::arrange(value) %>% 
+  ggplot2::ggplot(aes(x = intensity, fill = value)) +
+  geom_histogram(color = "#6c757d",
+                 position = "identity",
+                 alpha = 1, bins = 50) +
+  scale_fill_manual(values = c("#ced4da","#FEC601" )) +
+  theme(axis.text = element_text(size=15), legend.position = "none")+
+  labs(fill = "") +
+  theme_bw()
+```
+
+```{r}
+define_tests <- function(){
+      conditions <-
+        dplyr::distinct(exp_des, condition) %>% pull(condition)
+      
+      tests <-
+        tidyr::expand_grid(cond1 = conditions, cond2 = conditions) %>%
+        dplyr::filter(cond1 != cond2) %>%
+        dplyr::mutate(test = paste0(cond1, "_vs_", cond2)) %>%
+        dplyr::pull(test)
+      
+      return(tests)
+    }
+define_tests()
+
+    stat_t_test_single <- function(data, test, fc, alpha, p_adj_method, paired_test){
+      
+      cond_1 <- stringr::str_split(test, "_vs_")[[1]][1]
+      cond_2 <- stringr::str_split(test, "_vs_")[[1]][2]
+      
+      mat <- data %>%
+        dplyr::filter(condition == cond_1 | condition == cond_2) %>%
+        dplyr::mutate(label_test = paste(condition, replicate, sep = "_")) %>%
+        tidyr::pivot_wider(id_cols = "gene_names",
+                           names_from = "label_test",
+                           values_from = "intensity") %>%
+        tibble::column_to_rownames("gene_names") %>%
+        dplyr::relocate(dplyr::contains(cond_2), .after = dplyr::last_col()) %>%
+        na.omit() %>% 
+        as.matrix()
+      
+      a <- grep(cond_1, colnames(mat))
+      b <- grep(cond_2, colnames(mat))
+      
+      p_values_vec <- apply(mat, 1, function(x) t.test(x[a], x[b], paired_test=FALSE, var_equal=TRUE)$p.value)
+      
+      p_values <- p_values_vec %>%
+        as_tibble(rownames = NA) %>%
+        tibble::rownames_to_column(var = "gene_names") %>%
+        dplyr::rename(p_val = value)
+      
+      fold_change <- apply(mat, 1, function(x) mean(x[a]) - mean(x[b])) %>% #metterlo in log2?
+        as_tibble(rownames = NA) %>%
+        tibble::rownames_to_column(var = "gene_names") %>%
+        dplyr::rename(fold_change = value)
+      
+      p_adjusted <- p.adjust(p_values_vec, method = p_adj_method) %>% 
+        as_tibble(rownames = NA) %>%
+        tibble::rownames_to_column(var = "gene_names") %>%
+        dplyr::rename(p_adj = value)
+      
+      stat_data <- fold_change %>% 
+        dplyr::full_join(., p_values, by = "gene_names") %>% 
+        dplyr::full_join(., p_adjusted, by = "gene_names") %>% 
+        dplyr::mutate(significant = dplyr::if_else(abs(fold_change) >= fc & p_adj <= alpha, TRUE, FALSE)) %>% 
+        dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_significant") := significant) %>% 
+        dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_p_val") := p_val) %>% 
+        dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_fold_change") := fold_change) %>% 
+        dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_p_adj") := p_adj)
+      
+      return(stat_data)
+    }
+
+    
+b <- stat_t_test_single(data = data_imput , test = "micro_vs_nuc", fc = 0, alpha = 0.01, p_adj_method = "BH")
+
+a <- data_imput %>%
+  dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(value = dplyr::if_else(bin_intensity == 1, "Valid", "Imputed")) %>% 
+  ungroup() %>% 
+  dplyr::group_by(gene_names) %>% 
+  dplyr::mutate(imputed= dplyr::if_else(sum(bin_intensity)== 9, "N", "Y")) %>% 
+dplyr::mutate(for_imp = dplyr::case_when((sum(bin_intensity) / dplyr::n()) < 0.75 ~ "mixed",
+                                                (sum(bin_intensity) / dplyr::n()) == 1 ~ "no",
+                                                TRUE ~ "mean"
+                                                ))
+c <- b %>% 
+  dplyr::left_join(a, by="gene_names")
+```
+
+
+```{r volcano}
+ min_thr <- b %>% 
+        dplyr::filter(micro_vs_nuc_significant) %>% 
+        pull(micro_vs_nuc_p_val) %>% 
+        max()
+ 
+ggplot2::ggplot(c, aes(x=micro_vs_nuc_fold_change,
+                      y=-log10(micro_vs_nuc_p_val),
+                      color=dplyr::case_when(micro_vs_nuc_fold_change > 1 & micro_vs_nuc_significant==TRUE & imputed=="N"~ "#cf4446",
+                              micro_vs_nuc_fold_change < -1 & micro_vs_nuc_significant==TRUE & imputed=="N"~ "#0d0887",
+                              imputed=="Y" & for_imp=="mixed"~ "#FEC601",
+                              imputed=="Y" & for_imp=="mean"~ "#8ac926",
+
+                              TRUE ~ "grey"))) +
+  geom_point()+
+  theme_bw()+
+  geom_hline(yintercept = -log10(min_thr), linetype="longdash")+
+  geom_vline(xintercept = c(-1, 1), linetype="longdash")+
+  scale_color_identity()+
+  xlim(-7,NA)+
+  labs(title= "Volcano plot", x="Fold change", y= "-log(P-value)")
+
+print(data)
+```
+
+```{r Data Imputed Perseus}
+set.seed(11)
+        
+imputed_data <- data_filt %>%
+  dplyr::group_by(label) %>% 
+  # Define statistic to generate the random distribution relative to sample
+  dplyr::mutate(
+    mean = mean(intensity, na.rm = TRUE),
+    sd = sd(intensity, na.rm = TRUE),
+    n = sum(!is.na(intensity)),
+    total = nrow(data_filt) - n
+  ) %>%
+  dplyr::ungroup() %>%
+  # Impute missing values by random draws from a distribution
+  # which is left-shifted by parameter 'shift' * sd and scaled by parameter 'scale' * sd.
+  dplyr::mutate(imp_intensity = dplyr::case_when(
+    is.na(intensity) ~ rnorm(total, mean = (mean - 1.8 * sd), sd = sd * 0.3),
+    TRUE ~ intensity
+  )) %>%
+  dplyr::mutate(intensity = imp_intensity) %>%
+  dplyr::select(-c(mean, sd, n, total, imp_intensity))
+
+  
+
+f <- stat_t_test_single(data = imputed_data , test = "micro_vs_nuc", fc = 1, alpha = 0.01, p_adj_method = "BH")
+
+h <- imputed_data %>%
+  dplyr::group_by(gene_names, condition) %>%
+  dplyr::mutate(value = dplyr::if_else(bin_intensity == 1, "Valid", "Imputed")) %>% 
+  ungroup() %>% 
+  dplyr::group_by(gene_names) %>% 
+  dplyr::mutate(imputed= dplyr::if_else(sum(bin_intensity)== 9, "N", "Y"))
+
+k<- f %>% 
+  dplyr::left_join(h, by="gene_names")
+
+ggplot2::ggplot(k, aes(x=micro_vs_nuc_fold_change,
+                      y=-log10(micro_vs_nuc_p_val),
+                      color=dplyr::case_when(micro_vs_nuc_fold_change > 1 & micro_vs_nuc_significant==TRUE & imputed=="N"~ "#cf4446",
+                              micro_vs_nuc_fold_change < -1 & micro_vs_nuc_significant==TRUE & imputed=="N"~ "#0d0887",
+                              imputed=="Y"~ "#FEC601",
+                              TRUE ~ "grey"))) +
+  geom_point()+
+  theme_bw()+
+  geom_hline(yintercept = -log10(min_thr), linetype="longdash")+
+  geom_vline(xintercept = c(-1, 1), linetype="longdash")+
+  scale_color_identity()+
+  xlim(-7,NA)+
+  labs(title= "Volcano plot", x="Fold change", y= "-log(P-value)")
+
+print(data)
+
+imp <- imputed_data %>% 
+ dplyr::group_by(gene_names) %>% 
+  dplyr::mutate(imputed= dplyr::if_else(sum(bin_intensity)== 9, "N", "Y")) %>% 
+  dplyr::filter(imputed=="Y") 
+
+# scatter <- data_imput %>% 
+#   dplyr::group_by(gene_names) %>% 
+#   dplyr::mutate(imputed= dplyr::if_else(sum(bin_intensity)== 9, "N", "Y")) %>% 
+#   dplyr::filter(imputed=="Y") %>% 
+#   cbind(int=imp$intensity)
+# 
+# 
+# 
+# ggplot(scatter, aes(x=int, y=intensity)) +
+#   geom_point() 
+```
+
+```{r Limma}
+cond_1 <- stringr::str_split("micro_vs_nuc", "_vs_")[[1]][1]
+        cond_2 <- stringr::str_split("micro_vs_nuc", "_vs_")[[1]][2]
+
+mat <- data_filt %>%
+        dplyr::filter(condition == cond_1 | condition == cond_2) %>%
+        dplyr::mutate(label_test = paste(condition, replicate, sep = "_")) %>%
+        tidyr::pivot_wider(id_cols = "gene_names",
+                           names_from = "label_test",
+                           values_from = "intensity") %>%
+        column_to_rownames("gene_names") %>%
+        dplyr::relocate(dplyr::contains(cond_2), .after = dplyr::last_col()) %>%
+        na.omit() %>% 
+        as.matrix()
+
+cond_design <- mat %>% 
+          colnames() %>% 
+          stringr::str_remove("_[^_]*$")
+        
+        group_list <- factor(x=cond_design, levels = unique(cond_design))
+        
+        cond_1 <- stringr::str_split("micro_vs_nuc", "_vs_")[[1]][1]
+        cond_2 <- stringr::str_split("micro_vs_nuc", "_vs_")[[1]][2]
+        
+        design <- model.matrix(~group_list)
+        limma_fit <- lmFit(mat, design) 
+        fit <- eBayes(limma_fit)
+        stat_data <- topTable(fit, number = nrow(mat), adjust.method = "BH") %>% 
+          rownames_to_column("gene_names") %>%
+          dplyr::mutate(significant = dplyr::if_else(abs(logFC) >= fc &
+                                                       adj.P.Val <= alpha, TRUE, FALSE)) %>% 
+          dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_significant") := significant) %>% 
+          dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_p_val") := P.Value) %>%
+          dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_fold_change") := logFC) %>%
+          dplyr::rename(!!paste0(cond_1, "_vs_", cond_2, "_p_adj") := adj.P.Val) %>% 
+          dplyr::select(-c(AveExpr, t, B))
+```
+
